@@ -228,6 +228,57 @@ class SerializationTests(unittest.TestCase):
         chunks = list(gc._iter_chat_sse_chunks([raw[:38], raw[38:80], raw[80:]]))
         self.assertEqual(chunks, [obj1, obj2])
 
+    def test_structured_output_repairs_legacy_and_empty_fields(self):
+        schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["decision", "evidence", "next_step", "blocker_key"],
+            "properties": {
+                "decision": {"type": "string", "enum": ["continue", "candidate_complete", "blocked"]},
+                "evidence": {"type": "string", "minLength": 1},
+                "next_step": {"type": "string", "minLength": 1},
+                "blocker_key": {"type": "string"},
+            },
+        }
+        req = {"text": {"format": {"type": "json_schema", "json_schema": {
+            "name": "structured_output", "strict": True, "schema": schema
+        }}}}
+        legacy = '```json\n{"continue":false,"candidate_complete":true,"blocked":false,"blocker_key":"","evidence":"done"}\n```'
+        repaired = json.loads(gc._normalize_structured_output_text(req, legacy))
+        self.assertEqual(repaired["decision"], "candidate_complete")
+        self.assertTrue(repaired["next_step"])
+        self.assertNotIn("continue", repaired)
+
+        empty_next = json.dumps({"decision": "candidate_complete", "evidence": "done", "next_step": "", "blocker_key": ""})
+        repaired = json.loads(gc._normalize_structured_output_text(req, empty_next))
+        self.assertTrue(repaired["next_step"])
+
+    def test_structured_output_stream_suppresses_raw_deltas(self):
+        schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["decision", "evidence", "next_step", "blocker_key"],
+            "properties": {
+                "decision": {"type": "string", "enum": ["continue", "candidate_complete", "blocked"]},
+                "evidence": {"type": "string", "minLength": 1},
+                "next_step": {"type": "string", "minLength": 1},
+                "blocker_key": {"type": "string"},
+            },
+        }
+        req = {"model": "m", "text": {"format": {"type": "json_schema", "json_schema": {
+            "name": "structured_output", "strict": True, "schema": schema
+        }}}}
+        events = []
+        bridge = gc.StreamBridge(req, [], lambda raw: events.append(json.loads(raw)))
+        bridge.start()
+        bridge.process_chunk({"choices": [{"delta": {"content": '{"decision":"candidate_complete","evidence":"done"'}}]})
+        bridge.process_chunk({"choices": [{"delta": {"content": ',"next_step":"","blocker_key":""}'}}]})
+        bridge.finish()
+        self.assertNotIn("response.output_text.delta", [x.get("type") for x in events])
+        completed = next(x for x in events if x.get("type") == "response.completed")
+        text = completed["response"]["output"][0]["content"][0]["text"]
+        self.assertTrue(json.loads(text)["next_step"])
+
     def test_real_native_capture_after_normalization(self):
         source = os.getenv("GROK_NATIVE_CAPTURE", "/tmp/grok_native_upstream.sse")
         events = parse_sse(source)

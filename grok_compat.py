@@ -333,6 +333,127 @@ def _tools_to_chat(tools):
     return chat_tools or None
 
 
+def _response_json_schema(req):
+    """Return the schema when the request asks for strict JSON output."""
+    text = req.get("text")
+    if not isinstance(text, dict):
+        return None
+    fmt = text.get("format")
+    if not isinstance(fmt, dict) or fmt.get("type") != "json_schema":
+        return None
+    container = fmt.get("json_schema")
+    if not isinstance(container, dict):
+        container = fmt
+    schema = container.get("schema")
+    return schema if isinstance(schema, dict) else None
+
+
+def _decode_model_json(text):
+    """Decode a JSON object emitted directly or inside a markdown fence."""
+    if not isinstance(text, str):
+        return None
+    value = text.strip()
+    if value.startswith("```"):
+        lines = value.splitlines()
+        if len(lines) >= 2:
+            value = "\n".join(lines[1:]).strip()
+        if value.endswith("```"):
+            value = value[:-3].strip()
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, dict) else None
+    except (TypeError, json.JSONDecodeError):
+        pass
+    start = value.find("{")
+    if start < 0:
+        return None
+    try:
+        parsed, _ = json.JSONDecoder().raw_decode(value[start:])
+        return parsed if isinstance(parsed, dict) else None
+    except (TypeError, json.JSONDecodeError):
+        return None
+
+
+def _schema_string_fallback(name, schema, decision):
+    """Best-effort value for a string that the provider left empty."""
+    minimum = schema.get("minLength", 0)
+    if not isinstance(minimum, int) or minimum <= 0:
+        return ""
+    if name == "next_step":
+        return {
+            "candidate_complete": "No further implementation step is required.",
+            "blocked": "Resolve the reported blocker, then retry.",
+        }.get(decision, "Continue with the next actionable step.")
+    if name == "evidence":
+        return "The model did not provide structured evidence."
+    return "N/A"
+
+
+def _conform_model_json_to_schema(obj, schema):
+    """Repair common provider deviations from a Responses JSON schema."""
+    if not isinstance(obj, dict) or not isinstance(schema, dict):
+        return obj
+    repaired = copy.deepcopy(obj)
+
+    # Older/looser evaluators sometimes return three booleans instead of the
+    # required single `decision` enum.
+    if "decision" not in repaired:
+        if repaired.get("candidate_complete") is True:
+            repaired["decision"] = "candidate_complete"
+        elif repaired.get("blocked") is True:
+            repaired["decision"] = "blocked"
+        elif "continue" in repaired:
+            repaired["decision"] = "continue" if repaired.get("continue") is True else "candidate_complete"
+
+    required = schema.get("required") if isinstance(schema.get("required"), list) else []
+    properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+    for name in required:
+        prop = properties.get(name) if isinstance(properties.get(name), dict) else {}
+        if name not in repaired or repaired[name] is None:
+            if name == "decision" and isinstance(prop.get("enum"), list) and prop["enum"]:
+                repaired[name] = prop["enum"][0]
+            elif prop.get("type") == "string":
+                repaired[name] = _schema_string_fallback(
+                    name, prop, repaired.get("decision") if isinstance(repaired.get("decision"), str) else ""
+                )
+            elif prop.get("type") == "array":
+                repaired[name] = []
+            elif prop.get("type") == "object":
+                repaired[name] = {}
+            elif prop.get("type") == "integer":
+                repaired[name] = 0
+            elif prop.get("type") == "number":
+                repaired[name] = 0
+            elif prop.get("type") == "boolean":
+                repaired[name] = False
+        elif prop.get("type") == "string" and repaired[name] == "":
+            repaired[name] = _schema_string_fallback(
+                name, prop, repaired.get("decision") if isinstance(repaired.get("decision"), str) else ""
+            )
+        enum = prop.get("enum")
+        if isinstance(enum, list) and repaired[name] not in enum:
+            # A legacy mapping may already have set a valid decision above.
+            repaired[name] = repaired["decision"] if name != "decision" and isinstance(
+                repaired.get("decision"), str
+            ) and repaired["decision"] in enum else (enum[0] if enum else repaired[name])
+
+    if schema.get("additionalProperties") is False and isinstance(properties, dict):
+        repaired = {key: value for key, value in repaired.items() if key in properties}
+    return repaired
+
+
+def _normalize_structured_output_text(req, text):
+    """Make provider JSON conform closely enough for strict Responses clients."""
+    schema = _response_json_schema(req)
+    if not schema:
+        return text
+    parsed = _decode_model_json(text)
+    if parsed is None:
+        return text
+    repaired = _conform_model_json_to_schema(parsed, schema)
+    return json.dumps(repaired, ensure_ascii=False, separators=(",", ":"))
+
+
 def _has_shell_tool(req):
     return any(isinstance(t, dict) and t.get("type") == "shell" for t in (req.get("tools") or []))
 
@@ -826,6 +947,7 @@ def _nonstream_response_object(req, chat):
         })
 
     content_text = _text_from_content(message.get("content"))
+    content_text = _normalize_structured_output_text(req, content_text)
     if content_text or message.get("tool_calls") is None:
         output.append({
             "id": _rid("msg"),
@@ -1104,14 +1226,16 @@ class StreamBridge:
 
         content = _text_from_content(delta.get("content"))
         if content:
+            structured = _response_json_schema(self.req) is not None
             self._start_message()
             self.message_text += content
-            self.emit("response.output_text.delta", {
-                "item_id": self.message_id,
-                "output_index": self.output_count - 1,
-                "content_index": 0,
-                "delta": content,
-            })
+            if not structured:
+                self.emit("response.output_text.delta", {
+                    "item_id": self.message_id,
+                    "output_index": self.output_count - 1,
+                    "content_index": 0,
+                    "delta": content,
+                })
 
         for raw_call in delta.get("tool_calls") or []:
             if not isinstance(raw_call, dict):
@@ -1156,6 +1280,7 @@ class StreamBridge:
             })
 
         if self.message_id:
+            self.message_text = _normalize_structured_output_text(self.req, self.message_text)
             output_index = self.message_output_index
             self.emit("response.output_text.done", {
                 "item_id": self.message_id,
