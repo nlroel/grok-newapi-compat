@@ -272,21 +272,6 @@ The bridge also adds the required top-level xAI `ModelResponse` fields, includin
 
 ---
 
-## Important distinctions
-
-### `web_search` is not MCP
-
-Grok's `search_tool` searches configured MCP servers. It is not the server-side `web_search` tool.
-
-- No MCP servers configured means `search_tool` will correctly report that no MCP server is connected.
-- `web_search` is requested as a native server-side tool and is not provided by MCP.
-
-### `previous_response_id` support is path-dependent
-
-On the Chat Completions route, the bridge keeps a small local replay history. On the native Responses route, `previous_response_id` is left to NewAPI/upstream semantics. This project does not provide durable server-side storage.
-
----
-
 ## Security notes
 
 - Do not expose port `3001` directly.
