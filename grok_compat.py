@@ -11,6 +11,7 @@ Responses -> Chat Completions bridge (litellm/responses/
 litellm_completion_transformation), reduced to a standard-library service.
 """
 
+import codecs
 import copy
 import http.client
 import http.server
@@ -41,6 +42,33 @@ HOP_BY_HOP = {
 
 _history_lock = threading.Lock()
 _response_history = OrderedDict()
+
+
+def _iter_chat_sse_chunks(raw_chunks):
+    """Decode Chat Completions SSE even when NewAPI omits newline separators."""
+    decoder = codecs.getincrementaldecoder("utf-8")()
+    json_decoder = json.JSONDecoder()
+    buffer = ""
+    for raw in raw_chunks:
+        buffer += decoder.decode(raw)
+        while True:
+            buffer = buffer.lstrip()
+            if not buffer:
+                break
+            if not buffer.startswith("data:"):
+                logging.warning("ignoring non-SSE upstream prefix")
+                buffer = ""
+                break
+            payload = buffer[5:].lstrip()
+            if payload.startswith("[DONE]"):
+                return
+            try:
+                chunk, consumed = json_decoder.raw_decode(payload)
+            except json.JSONDecodeError:
+                # Wait for the remainder of a JSON object split across reads.
+                break
+            buffer = payload[consumed:]
+            yield chunk
 
 
 def remember_response(response_id, messages):
@@ -1561,6 +1589,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         body = json.dumps(chat, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         upstream_path = "/v1/chat/completions"
+
+        # Goal evaluation uses a smaller Chat-only request. Capture it separately
+        # so ordinary large native Responses captures are not overwritten.
+        goal_debug_base = None
+        goal_upstream = None
+        request_id = self.headers.get("X-Grok-Req-Id", "")
+        if DEBUG_CAPTURE and request_id.startswith("xai-goal-eval"):
+            try:
+                goal_debug_dir = os.path.join(DEBUG_DIR, "goal")
+                os.makedirs(goal_debug_dir, exist_ok=True)
+                stamp = str(int(time.time() * 1000))
+                safe_req_id = "".join(c if c.isalnum() or c in "-_" else "_" for c in request_id)
+                goal_debug_base = os.path.join(goal_debug_dir, f"{stamp}-{safe_req_id}")
+                with open(goal_debug_base + "-responses-request.json", "wb") as f:
+                    f.write(raw_body)
+                with open(goal_debug_base + "-chat-request.json", "wb") as f:
+                    f.write(body)
+                logging.info("goal eval debug captured to %s", goal_debug_dir)
+            except OSError:
+                logging.warning("could not save goal eval request capture")
         try:
             conn = http.client.HTTPConnection(UPSTREAM_HOST, UPSTREAM_PORT, timeout=UPSTREAM_TIMEOUT)
             conn.request("POST", upstream_path, body=body, headers=self._upstream_headers(body))
@@ -1579,31 +1627,36 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
 
             if req.get("stream"):
+                if goal_debug_base:
+                    try:
+                        goal_upstream = open(goal_debug_base + "-upstream.sse", "wb")
+                    except OSError:
+                        logging.warning("could not save goal eval upstream capture")
                 self._begin_upstream_response(response, content_type)
                 bridge = StreamBridge(req, request_messages, lambda data: self._write_sse(data))
                 bridge.start()
-                buffer = b""
-                while True:
-                    line = response.readline()
-                    if not line:
-                        break
-                    line = line.strip()
-                    if not line:
-                        continue
-                    if not line.startswith(b"data:"):
-                        continue
-                    data = line[5:].strip()
-                    if data == b"[DONE]":
-                        break
-                    if not data:
-                        continue
-                    try:
-                        chunk = json.loads(data.decode("utf-8"))
-                    except (UnicodeDecodeError, json.JSONDecodeError):
-                        logging.warning("ignoring invalid upstream SSE JSON")
-                        continue
+
+                def upstream_chunks():
+                    while True:
+                        raw = response.read(64 * 1024)
+                        if not raw:
+                            return
+                        if goal_upstream:
+                            try:
+                                goal_upstream.write(raw)
+                                goal_upstream.flush()
+                            except OSError:
+                                pass
+                        yield raw
+
+                for chunk in _iter_chat_sse_chunks(upstream_chunks()):
                     bridge.process_chunk(chunk)
                 bridge.finish()
+                if goal_upstream:
+                    try:
+                        goal_upstream.close()
+                    except Exception:
+                        pass
                 self.wfile.flush()
                 return
 

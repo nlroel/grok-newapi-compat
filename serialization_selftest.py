@@ -218,6 +218,16 @@ class SerializationTests(unittest.TestCase):
         completed = next(x for x in events if x.get("type") == "response.completed")
         assert_response(self, completed["response"], "chat bridge completed response")
 
+    def test_chat_sse_parser_handles_newline_less_stream(self):
+        obj1 = {"choices": [{"delta": {"content": "计"}, "index": 0}]}
+        obj2 = {"choices": [{"delta": {"content": "算"}, "index": 0}]}
+        # No newlines between data frames, and UTF-8 is split at a chunk edge.
+        raw = (b'data:' + json.dumps(obj1, ensure_ascii=False).encode('utf-8')
+               + b'data:' + json.dumps(obj2, ensure_ascii=False).encode('utf-8')
+               + b'data: [DONE]')
+        chunks = list(gc._iter_chat_sse_chunks([raw[:38], raw[38:80], raw[80:]]))
+        self.assertEqual(chunks, [obj1, obj2])
+
     def test_real_native_capture_after_normalization(self):
         source = os.getenv("GROK_NATIVE_CAPTURE", "/tmp/grok_native_upstream.sse")
         events = parse_sse(source)
