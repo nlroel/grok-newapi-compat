@@ -225,6 +225,17 @@ curl -sS http://127.0.0.1:3001/v1/responses \
 
 ---
 
+## Protocol coverage notes
+
+- Responses 的 function 工具会转换为 Chat Completions；hosted/server-side 工具保留在 native Responses 通道。
+- Chat 通道的 `previous_response_id` 使用有界的内存内完整链路回放，不是持久化存储；native Responses 通道遵循 NewAPI/上游语义。
+- Responses reasoning items 会尽量折叠为下一条 Chat assistant 的 `reasoning_content`，并在 Chat 通道回放历史中保留。
+- Chat 流遇到中途错误时会发送 `response.failed`，不会再伪装成正常 `response.completed`。
+- 如果 native Responses 流在 terminal event 前结束或直接 `[DONE]`，会合成 `response.failed`。
+- 结构化输出修复支持常见的递归 required/type 问题，但不是完整 JSON Schema 校验器。
+
+---
+
 ## License
 
 MIT. See [LICENSE](./LICENSE).

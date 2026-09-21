@@ -47,7 +47,7 @@ _response_history = OrderedDict()
 
 def _iter_chat_sse_chunks(raw_chunks):
     """Decode Chat Completions SSE even when NewAPI omits newline separators."""
-    decoder = codecs.getincrementaldecoder("utf-8")()
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
     json_decoder = json.JSONDecoder()
     buffer = ""
     for raw in raw_chunks:
@@ -167,6 +167,66 @@ def _tool_output_to_content(value):
         return str(value)
 
 
+def _fold_chat_reasoning(messages):
+    """Fold Responses reasoning siblings into the next Chat assistant message.
+
+    xAI's Chat path expects reasoning as `reasoning_content` on the assistant
+    message. A standalone assistant message containing only reasoning can be
+    rejected by OpenAI-compatible providers, and trailing reasoning has no
+    assistant to attach to, so it is intentionally dropped.
+    """
+    folded = []
+    pending_reasoning = []
+
+    def message_text(message):
+        return _text_from_content(message.get("content"))
+
+    for message in messages:
+        role = message.get("role")
+        if role == "assistant":
+            reasoning = _reasoning_text(
+                message.get("reasoning_content") or message.get("reasoning")
+            )
+            if reasoning:
+                pending_reasoning.append(reasoning)
+
+            has_payload = bool(message_text(message)) or bool(message.get("tool_calls"))
+            if not has_payload:
+                # A reasoning-only assistant item: wait for the assistant that
+                # follows it. If no assistant follows, it is dropped below.
+                continue
+
+            new_message = copy.deepcopy(message)
+            new_message.pop("reasoning", None)
+            if pending_reasoning:
+                new_message["reasoning_content"] = "\n".join(pending_reasoning)
+                pending_reasoning = []
+            folded.append(new_message)
+            continue
+
+        if role in ("user", "system", "tool"):
+            # Reasoning belongs to an assistant turn. If user/system/tool
+            # interrupts it, following xAI's behavior, drop it.
+            pending_reasoning = []
+        folded.append(copy.deepcopy(message))
+
+    return folded
+
+
+def _ensure_json_arguments(arguments):
+    """Return Chat function.arguments as JSON text, matching xAI's sanitizer."""
+    if not isinstance(arguments, str):
+        try:
+            return json.dumps(arguments or {}, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return "{}"
+    try:
+        json.loads(arguments)
+        return arguments
+    except (TypeError, json.JSONDecodeError):
+        return "{}"
+
+
 def _input_item_to_messages(item):
     """Convert one Responses input item to one or more Chat messages."""
     if isinstance(item, str):
@@ -220,9 +280,7 @@ def _input_item_to_messages(item):
     if item_type in ("function_call", "custom_tool_call"):
         call_id = item.get("call_id") or item.get("id") or _rid("call")
         name = item.get("name", "")
-        arguments = item.get("arguments")
-        if not isinstance(arguments, str):
-            arguments = json.dumps(arguments or {}, ensure_ascii=False)
+        arguments = _ensure_json_arguments(item.get("arguments"))
         return [{
             "role": "assistant",
             "content": None,
@@ -416,8 +474,217 @@ def _normalize_blocker_key(value):
     return value[:128]
 
 
+def _schema_accepts_type(value, schema):
+    expected = schema.get("type")
+    if isinstance(expected, list):
+        checks = {
+            "object": lambda v: isinstance(v, dict),
+            "array": lambda v: isinstance(v, list),
+            "string": lambda v: isinstance(v, str),
+            "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
+            "number": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
+            "boolean": lambda v: isinstance(v, bool),
+            "null": lambda v: v is None,
+        }
+        return any(checks.get(t, lambda _v: True)(value) for t in expected)
+    checks = {
+        "object": isinstance(value, dict),
+        "array": isinstance(value, list),
+        "string": isinstance(value, str),
+        "integer": isinstance(value, int) and not isinstance(value, bool),
+        "number": isinstance(value, (int, float)) and not isinstance(value, bool),
+        "boolean": isinstance(value, bool),
+        "null": value is None,
+    }
+    return checks.get(expected, True)
+
+
+def _default_for_schema(schema, name="", decision=""):
+    """Materialize a conservative value for a required missing property."""
+    if not isinstance(schema, dict):
+        return None
+    if "default" in schema:
+        return copy.deepcopy(schema["default"])
+    if "const" in schema:
+        return copy.deepcopy(schema["const"])
+    expected = schema.get("type")
+    if isinstance(expected, list):
+        expected = next((t for t in expected if t != "null"), expected[0] if expected else None)
+    if expected == "string":
+        return _schema_string_fallback(name, schema, decision)
+    if expected == "array":
+        return []
+    if expected == "object":
+        return {}
+    if expected == "integer":
+        return 0
+    if expected == "number":
+        return 0
+    if expected == "boolean":
+        return False
+    if expected == "null":
+        return None
+    if "properties" in schema:
+        return {}
+    if "items" in schema:
+        return []
+    return None
+
+
+def _conform_value(value, schema, name="", decision=""):
+    """Recursively coerce common provider deviations to a JSON schema.
+
+    This is intentionally conservative: it fixes missing required fields and
+    obvious type mismatches without trying to infer arbitrary business rules.
+    """
+    if not isinstance(schema, dict):
+        return copy.deepcopy(value)
+
+    # Prefer the first alternative that already fits; otherwise use the first
+    # alternative. Full JSON Schema combinator validation is out of scope.
+    for combinator in ("oneOf", "anyOf"):
+        alternatives = schema.get(combinator)
+        if isinstance(alternatives, list) and alternatives:
+            matching = [
+                sub for sub in alternatives
+                if isinstance(sub, dict) and _schema_accepts_type(value, sub)
+            ]
+            sub = matching[0] if matching else alternatives[0]
+            return _conform_value(value, sub, name, decision)
+
+    if "allOf" in schema and isinstance(schema["allOf"], list):
+        for sub in schema["allOf"]:
+            if isinstance(sub, dict):
+                value = _conform_value(value, sub, name, decision)
+
+    enum = schema.get("enum")
+    if isinstance(enum, list) and enum:
+        if value in enum:
+            return copy.deepcopy(value)
+        default = schema.get("default", enum[0])
+        return default if default in enum else enum[0]
+
+    expected = schema.get("type")
+    if isinstance(expected, list):
+        if any(
+            (t == "null" and value is None)
+            or (t == "string" and isinstance(value, str))
+            or (t == "integer" and isinstance(value, int) and not isinstance(value, bool))
+            or (t == "number" and isinstance(value, (int, float)) and not isinstance(value, bool))
+            or (t == "boolean" and isinstance(value, bool))
+            or (t == "array" and isinstance(value, list))
+            or (t == "object" and isinstance(value, dict))
+            for t in expected
+        ):
+            expected = None
+        else:
+            expected = next((t for t in expected if t != "null"), expected[0] if expected else None)
+
+    if expected == "object" or isinstance(value, dict) and "properties" in schema:
+        if not isinstance(value, dict):
+            value = _default_for_schema(schema, name, decision) or {}
+        value = copy.deepcopy(value)
+        properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+        required = schema.get("required") if isinstance(schema.get("required"), list) else []
+
+        for key, sub_schema in properties.items():
+            if key in value:
+                value[key] = _conform_value(value[key], sub_schema, key, decision)
+            elif key in required:
+                value[key] = _default_for_schema(sub_schema, key, decision)
+
+        additional = schema.get("additionalProperties", True)
+        if additional is False:
+            value = {key: item for key, item in value.items() if key in properties}
+        elif isinstance(additional, dict):
+            known = set(properties)
+            for key in value:
+                if key not in known:
+                    value[key] = _conform_value(value[key], additional, key, decision)
+        return value
+
+    if expected == "array" or isinstance(value, list) and "items" in schema:
+        if not isinstance(value, list):
+            value = _default_for_schema(schema, name, decision) or []
+        value = [copy.deepcopy(item) for item in value]
+        item_schema = schema.get("items")
+        if isinstance(item_schema, dict):
+            value = [_conform_value(item, item_schema, name, decision) for item in value]
+        min_items = schema.get("minItems", 0)
+        if isinstance(min_items, int) and len(value) < min_items:
+            default_item = _default_for_schema(item_schema, name, decision)
+            value.extend([default_item] * (min_items - len(value)))
+        max_items = schema.get("maxItems")
+        if isinstance(max_items, int) and max_items >= 0:
+            value = value[:max_items]
+        return value
+
+    if expected == "string":
+        if value is None:
+            value = ""
+        elif isinstance(value, (dict, list)):
+            try:
+                value = json.dumps(value, ensure_ascii=False)
+            except (TypeError, ValueError):
+                value = str(value)
+        elif isinstance(value, bool):
+            value = "true" if value else "false"
+        elif not isinstance(value, str):
+            value = str(value)
+        if isinstance(value, str) and not value.strip():
+            value = _schema_string_fallback(name, schema, decision)
+        return value
+
+    if expected == "integer":
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        if isinstance(value, str):
+            try:
+                return int(value.strip())
+            except ValueError:
+                return 0
+        return 0
+
+    if expected == "number":
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, (int, float)):
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = float(value.strip())
+                return int(parsed) if parsed.is_integer() else parsed
+            except ValueError:
+                return 0
+        return 0
+
+    if expected == "boolean":
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in ("true", "1", "yes"):
+                return True
+            if lowered in ("false", "0", "no"):
+                return False
+        if value in (1, 1.0):
+            return True
+        if value in (0, 0.0):
+            return False
+        return False
+
+    if expected == "null":
+        return None
+
+    return copy.deepcopy(value)
+
+
 def _conform_model_json_to_schema(obj, schema):
-    """Repair common provider deviations from a Responses JSON schema."""
+    """Repair provider JSON, including xAI goal evaluator semantic rules."""
     if not isinstance(obj, dict) or not isinstance(schema, dict):
         return obj
     repaired = copy.deepcopy(obj)
@@ -436,49 +703,21 @@ def _conform_model_json_to_schema(obj, schema):
         if normalized:
             repaired["decision"] = normalized
 
-    required = schema.get("required") if isinstance(schema.get("required"), list) else []
-    properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
-    for name in required:
-        prop = properties.get(name) if isinstance(properties.get(name), dict) else {}
-        value = repaired.get(name)
-        invalid_empty_string = isinstance(value, str) and not value.strip()
-        if name not in repaired or value is None or invalid_empty_string:
-            if name == "decision" and isinstance(prop.get("enum"), list) and prop["enum"]:
-                repaired[name] = prop["enum"][0]
-            elif prop.get("type") == "string":
-                repaired[name] = _schema_string_fallback(
-                    name, prop, repaired.get("decision") if isinstance(repaired.get("decision"), str) else ""
-                )
-            elif prop.get("type") == "array":
-                repaired[name] = []
-            elif prop.get("type") == "object":
-                repaired[name] = {}
-            elif prop.get("type") == "integer":
-                repaired[name] = 0
-            elif prop.get("type") == "number":
-                repaired[name] = 0
-            elif prop.get("type") == "boolean":
-                repaired[name] = False
+    repaired = _conform_value(repaired, schema)
+    decision = repaired.get("decision")
 
-        # xAI's goal parser is stricter than the JSON schema: it validates
-        # semantic relationships between decision and blocker_key as well.
-        if name == "blocker_key" and repaired.get("decision") == "blocked":
-            repaired[name] = _normalize_blocker_key(repaired.get(name)) or "unknown_blocker"
-        elif name == "blocker_key":
-            repaired[name] = ""
+    # xAI's goal parser is stricter than the JSON schema: it validates
+    # semantic relationships between decision and blocker_key as well.
+    if decision == "blocked":
+        repaired["blocker_key"] = _normalize_blocker_key(repaired.get("blocker_key")) or "unknown_blocker"
+    elif "blocker_key" in repaired:
+        repaired["blocker_key"] = ""
 
-        enum = prop.get("enum")
-        if isinstance(enum, list) and repaired.get(name) not in enum:
-            # A legacy mapping may already have set a valid decision above.
-            decision = repaired.get("decision")
-            if name != "decision" and isinstance(decision, str) and decision in enum:
-                repaired[name] = decision
-            elif enum:
-                repaired[name] = enum[0]
-
-    if schema.get("additionalProperties") is False and isinstance(properties, dict):
-        repaired = {key: value for key, value in repaired.items() if key in properties}
+    if schema.get("additionalProperties") is False and isinstance(schema.get("properties"), dict):
+        repaired = {key: value for key, value in repaired.items() if key in schema["properties"]}
     return repaired
+
+
 def _normalize_structured_output_text(req, text):
     """Make provider JSON conform closely enough for strict Responses clients."""
     schema = _response_json_schema(req)
@@ -564,6 +803,7 @@ def responses_to_chat_request(req):
     elif input_value != "":
         messages.append({"role": "user", "content": input_value})
 
+    messages = _fold_chat_reasoning(messages)
     tools = _tools_to_chat(req.get("tools"))
 
     chat = {
@@ -593,6 +833,8 @@ def responses_to_chat_request(req):
     reasoning = req.get("reasoning")
     if isinstance(reasoning, dict) and reasoning.get("effort"):
         chat["reasoning_effort"] = reasoning["effort"]
+    elif req.get("reasoning_effort"):
+        chat["reasoning_effort"] = req["reasoning_effort"]
 
     if chat["stream"]:
         chat["stream_options"] = {"include_usage": True}
@@ -634,8 +876,14 @@ def _usage_from_chat(usage):
 def _status_from_finish_reason(reason):
     if reason == "length":
         return "incomplete", {"reason": "max_output_tokens"}
+    if reason in ("context_length_exceeded", "max_prompt_tokens"):
+        return "incomplete", {"reason": "max_prompt_tokens"}
+    if reason == "max_time_limit":
+        return "incomplete", {"reason": "max_time_limit"}
     if reason == "content_filter":
         return "incomplete", {"reason": "content_filter"}
+    if reason in ("failed", "error", "aborted", "cancelled"):
+        return "failed", None
     return "completed", None
 
 
@@ -963,6 +1211,9 @@ def _response_object(
         "top_logprobs": int(req.get("top_logprobs") or 0),
         "presence_penalty": req.get("presence_penalty", 0),
         "frequency_penalty": req.get("frequency_penalty", 0),
+        "max_tool_calls": req.get("max_tool_calls"),
+        "prompt_cache_key": req.get("prompt_cache_key"),
+        "safety_identifier": req.get("safety_identifier"),
         "completed_at": completed_at,
     }
 
@@ -1049,33 +1300,44 @@ def _nonstream_response_object(req, chat):
 def chat_output_messages_from_response(response):
     """Create replayable Chat messages from a transformed Responses object."""
     messages = []
+    pending_reasoning = []
+
+    def add_assistant_message(content, tool_calls=None):
+        message = {"role": "assistant", "content": content}
+        if pending_reasoning:
+            message["reasoning_content"] = "\n".join(pending_reasoning)
+            pending_reasoning.clear()
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+        messages.append(message)
+
     for item in response.get("output", []):
         item_type = item.get("type")
+        if item_type == "reasoning":
+            reasoning = _reasoning_text(item.get("summary") or item.get("content") or [])
+            if reasoning:
+                pending_reasoning.append(reasoning)
+            continue
         if item_type == "message":
             text = "".join(
                 part.get("text", "") for part in item.get("content", [])
                 if isinstance(part, dict) and part.get("type") == "output_text"
             )
-            messages.append({"role": "assistant", "content": text})
-        elif item_type == "function_call":
-            messages.append({
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [{
+            add_assistant_message(text)
+            continue
+        if item_type in ("function_call", "shell_call"):
+            if item_type == "function_call":
+                tool_call = {
                     "id": item.get("call_id") or item.get("id"),
                     "type": "function",
                     "function": {
                         "name": item.get("name", ""),
-                        "arguments": item.get("arguments", "{}"),
+                        "arguments": _ensure_json_arguments(item.get("arguments", "{}")),
                     },
-                }],
-            })
-        elif item_type == "shell_call":
-            action = item.get("action") or {}
-            messages.append({
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [{
+                }
+            else:
+                action = item.get("action") or {}
+                tool_call = {
                     "id": item.get("call_id") or item.get("id"),
                     "type": "function",
                     "function": {
@@ -1086,8 +1348,21 @@ def chat_output_messages_from_response(response):
                             "max_output_length": action.get("max_output_length"),
                         }, ensure_ascii=False),
                     },
-                }],
-            })
+                }
+            if not tool_call["id"]:
+                tool_call["id"] = _rid("call")
+
+            # Consecutive Responses calls belong to one assistant tool_calls
+            # message, matching the shape expected by Chat Completions.
+            if (
+                messages
+                and messages[-1].get("role") == "assistant"
+                and messages[-1].get("tool_calls")
+                and not messages[-1].get("content")
+            ):
+                messages[-1]["tool_calls"].append(tool_call)
+            else:
+                add_assistant_message(None, [tool_call])
     return messages
 
 
@@ -1113,6 +1388,7 @@ class StreamBridge:
         self.tools = {}
         self.output_count = 0
         self.completed = False
+        self.failure = None
 
     def _base_response(self, status="in_progress", output=None):
         return _response_object(
@@ -1236,6 +1512,16 @@ class StreamBridge:
 
     def process_chunk(self, chunk):
         if not isinstance(chunk, dict):
+            return
+        error = chunk.get("error")
+        if error:
+            if isinstance(error, dict):
+                message = error.get("message") or "Upstream stream error"
+                code = str(error.get("code") or "server_error")
+            else:
+                message = str(error)
+                code = "server_error"
+            self.failure = {"message": message, "code": code}
             return
         if chunk.get("model"):
             self.model = chunk["model"]
@@ -1449,8 +1735,23 @@ class StreamBridge:
                 })
         return output
 
+    def fail(self, message, code="server_error"):
+        """Emit xAI's terminal failed event instead of faking completion."""
+        if self.completed:
+            return
+        self.finish_items()
+        response = self._base_response(status="failed", output=self.final_output())
+        response["error"] = {"code": code, "message": message}
+        response["usage"] = _usage_from_chat(self.usage or {})
+        response["incomplete_details"] = None
+        self.emit("response.failed", {"response": response})
+        self.completed = True
+
     def finish(self):
         if self.completed:
+            return
+        if self.failure:
+            self.fail(**self.failure)
             return
         self.finish_items()
         status, incomplete_details = _status_from_finish_reason(self.finish_reason)
@@ -1460,12 +1761,21 @@ class StreamBridge:
         )
         if response.get("usage") is None:
             # xAI's goal evaluator rejects a terminal response without usage
-            # accounting.  Keep the terminal frame valid even if a broken
+            # accounting. Keep the terminal frame valid even if a broken
             # upstream omitted Chat Completions usage.
             response["usage"] = _usage_from_chat({})
         response["incomplete_details"] = incomplete_details
-        self.emit("response.completed", {"response": response})
+        if status == "failed":
+            response["error"] = {
+                "code": "server_error",
+                "message": "Upstream stream reported failure",
+            }
+            self.emit("response.failed", {"response": response})
+        else:
+            self.emit("response.completed", {"response": response})
         self.completed = True
+        if status == "failed":
+            return
 
         replay = copy.deepcopy(self.request_messages)
         tool_calls = []
@@ -1475,7 +1785,7 @@ class StreamBridge:
                 "type": "function",
                 "function": {
                     "name": state["name"],
-                    "arguments": state["arguments"] or "{}",
+                    "arguments": _ensure_json_arguments(state["arguments"] or "{}"),
                 },
             })
         assistant_message = {
@@ -1643,6 +1953,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 except OSError:
                     logging.warning("could not save native SSE capture")
             sequence = 0
+            saw_terminal = False
+            native_response_id = None
+            native_created_at = None
+            native_error = None
+
+            def write_sse_event(event_type, payload):
+                data = b"data: " + json.dumps(
+                    payload, ensure_ascii=False, separators=(",", ":")
+                ).encode("utf-8") + b"\n\n"
+                if debug_forwarded:
+                    try:
+                        debug_forwarded.write(f"event: {event_type}\n".encode("utf-8") + data)
+                        debug_forwarded.flush()
+                    except OSError:
+                        pass
+                self.wfile.write(f"event: {event_type}\n".encode("utf-8") + data)
+                self.wfile.flush()
+
             while True:
                 line = response.readline()
                 if not line:
@@ -1662,6 +1990,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     continue
                 raw = text[5:].strip()
                 if raw == "[DONE]":
+                    if not saw_terminal:
+                        error = native_error or {
+                            "code": "server_error",
+                            "message": "Upstream Responses stream ended before a terminal event",
+                        }
+                        failed = _response_object(
+                            req,
+                            response_id=native_response_id or _rid("resp"),
+                            status="failed",
+                            output=[],
+                            model=req.get("model", ""),
+                            created_at=native_created_at or int(time.time()),
+                            usage=_normalize_native_usage(None),
+                            completed_at=int(time.time()),
+                        )
+                        failed["error"] = error
+                        failed = _normalize_native_response(req, failed)
+                        failed["error"] = error
+                        payload = {"type": "response.failed", "response": failed}
+                        payload["sequence_number"] = sequence
+                        sequence += 1
+                        write_sse_event("response.failed", payload)
+                        saw_terminal = True
                     self.wfile.write(b"data: [DONE]\n\n")
                     self.wfile.flush()
                     continue
@@ -1678,10 +2029,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         if isinstance(part, dict) and part.get("type") == "summary_text" and not part.get("text"):
                             part["text"] = ""
                     payload = _normalize_native_sse_payload(payload)
-                    if payload.get("type") in ("response.created", "response.in_progress", "response.completed"):
-                        native_response = payload.get("response")
-                        if isinstance(native_response, dict):
-                            payload["response"] = _normalize_native_response(req, native_response)
+                    if payload.get("type") == "response.error":
+                        code = payload.get("code") or "server_error"
+                        native_error = {
+                            "code": str(code),
+                            "message": str(payload.get("message") or "Upstream Responses error"),
+                        }
+                    native_response = payload.get("response")
+                    if isinstance(native_response, dict):
+                        native_response_id = native_response.get("id") or native_response_id
+                        native_created_at = native_response.get("created_at") or native_created_at
+                    if payload.get("type") in (
+                        "response.completed", "response.incomplete", "response.failed"
+                    ):
+                        saw_terminal = True
+                    if payload.get("type") in (
+                        "response.created", "response.in_progress", "response.completed",
+                        "response.incomplete", "response.failed"
+                    ) and isinstance(native_response, dict):
+                        payload["response"] = _normalize_native_response(req, native_response)
                 forwarded = b"data: " + json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n\n"
                 if debug_forwarded:
                     try:
@@ -1691,6 +2057,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         pass
                 self.wfile.write(forwarded)
                 self.wfile.flush()
+            if not saw_terminal:
+                error = native_error or {
+                    "code": "server_error",
+                    "message": "Upstream Responses stream ended without a terminal event",
+                }
+                failed = _response_object(
+                    req,
+                    response_id=native_response_id or _rid("resp"),
+                    status="failed",
+                    output=[],
+                    model=req.get("model", ""),
+                    created_at=native_created_at or int(time.time()),
+                    usage=_normalize_native_usage(None),
+                    completed_at=int(time.time()),
+                )
+                failed["error"] = error
+                failed = _normalize_native_response(req, failed)
+                failed["error"] = error
+                payload = {"type": "response.failed", "response": failed}
+                payload["sequence_number"] = sequence
+                sequence += 1
+                write_sse_event("response.failed", payload)
+
             try:
                 if debug_upstream:
                     debug_upstream.close()
@@ -1737,9 +2126,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         previous_id = req.get("previous_response_id")
         chat = responses_to_chat_request(req)
-        request_messages = copy.deepcopy(chat.get("messages", []))
-        if previous_id:
-            chat["messages"] = previous_messages(previous_id) + chat["messages"]
+        # Keep the full chain, not just this request. A later request using
+        # this response as previous_response_id must replay every earlier turn.
+        request_messages = previous_messages(previous_id) + copy.deepcopy(
+            chat.get("messages", [])
+        )
+        chat["messages"] = request_messages
 
         incoming_tools = []
         for tool in req.get("tools") or []:
@@ -1776,6 +2168,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 logging.info("goal eval debug captured to %s", goal_debug_dir)
             except OSError:
                 logging.warning("could not save goal eval request capture")
+        bridge = None
         try:
             conn = http.client.HTTPConnection(UPSTREAM_HOST, UPSTREAM_PORT, timeout=UPSTREAM_TIMEOUT)
             conn.request("POST", upstream_path, body=body, headers=self._upstream_headers(body))
@@ -1842,10 +2235,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             logging.info("client disconnected")
         except (OSError, http.client.HTTPException) as exc:
             logging.warning("upstream error: %s", exc)
-            try:
-                self._send_error_json(502, f"NewAPI unavailable: {exc}")
-            except Exception:
-                pass
+            if bridge and not bridge.completed:
+                try:
+                    bridge.fail(f"NewAPI unavailable: {exc}")
+                except Exception:
+                    pass
+            else:
+                try:
+                    self._send_error_json(502, f"NewAPI unavailable: {exc}")
+                except Exception:
+                    pass
         finally:
             try:
                 response.close()

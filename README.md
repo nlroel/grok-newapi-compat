@@ -272,6 +272,17 @@ The bridge also adds the required top-level xAI `ModelResponse` fields, includin
 
 ---
 
+## Protocol coverage notes
+
+- Responses function tools are converted to Chat Completions; hosted/server-side tools remain on the native Responses route.
+- Chat-path `previous_response_id` uses bounded in-memory replay across the full response chain. It is not durable storage; native Responses path follows NewAPI/upstream semantics.
+- Responses reasoning items are folded into the next Chat assistant message as `reasoning_content` where possible, and preserved in Chat-path replay history.
+- Chat streams now emit `response.failed` instead of pretending a mid-stream error completed normally.
+- Native Responses streams synthesize `response.failed` if upstream closes or sends `[DONE]` without a terminal event.
+- Structured-output repair is recursive for common required/type issues, but it is not a complete JSON Schema validator.
+
+---
+
 ## Security notes
 
 - Do not expose port `3001` directly.

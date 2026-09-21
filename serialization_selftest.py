@@ -320,6 +320,76 @@ class SerializationTests(unittest.TestCase):
         text = completed["response"]["output"][0]["content"][0]["text"]
         self.assertTrue(json.loads(text)["next_step"])
 
+    def test_chat_input_folds_reasoning_into_next_assistant(self):
+        req = {"model": "m", "input": [
+            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "first"}]},
+            {"type": "message", "role": "assistant", "content": "answer"},
+            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "trailing"}]},
+            {"type": "message", "role": "user", "content": "next"},
+        ]}
+        chat = gc.responses_to_chat_request(req)
+        self.assertEqual(chat["messages"][0]["role"], "assistant")
+        self.assertEqual(chat["messages"][0]["content"], "answer")
+        self.assertEqual(chat["messages"][0]["reasoning_content"], "first")
+        self.assertEqual(chat["messages"][1]["role"], "user")
+        self.assertEqual(len(chat["messages"]), 2)
+
+    def test_output_history_keeps_reasoning_and_combines_tool_calls(self):
+        response = {"output": [
+            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "think"}]},
+            {"type": "function_call", "call_id": "c1", "name": "one", "arguments": "{}"},
+            {"type": "shell_call", "call_id": "c2", "action": {"type": "exec", "commands": ["pwd"]}},
+        ]}
+        messages = gc.chat_output_messages_from_response(response)
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]["role"], "assistant")
+        self.assertEqual(messages[0]["reasoning_content"], "think")
+        self.assertEqual([c["id"] for c in messages[0]["tool_calls"]], ["c1", "c2"])
+
+    def test_chat_stream_upstream_error_emits_failed(self):
+        events = []
+        bridge = gc.StreamBridge({"model": "m"}, [], lambda raw: events.append(json.loads(raw)))
+        bridge.start()
+        bridge.process_chunk({"choices": [{"delta": {"content": "partial"}}]})
+        bridge.process_chunk({"error": {"code": 42, "message": "upstream exploded"}})
+        bridge.finish()
+        failed = [x for x in events if x.get("type") == "response.failed"]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]["response"]["status"], "failed")
+        self.assertEqual(failed[0]["response"]["error"]["code"], "42")
+        self.assertEqual(failed[0]["response"]["error"]["message"], "upstream exploded")
+        self.assertIsInstance(failed[0]["response"]["usage"], dict)
+        self.assertNotIn("response.completed", [x.get("type") for x in events])
+
+    def test_structured_output_recursive_schema_repair(self):
+        schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["outer", "count"],
+            "properties": {
+                "count": {"type": "integer"},
+                "outer": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["text", "enabled"],
+                    "properties": {
+                        "text": {"type": "string", "minLength": 1},
+                        "enabled": {"type": "boolean"},
+                    },
+                },
+            },
+        }
+        req = {"text": {"format": {"type": "json_schema", "json_schema": {
+            "name": "generic", "strict": True, "schema": schema
+        }}}}
+        repaired = json.loads(gc._normalize_structured_output_text(req, json.dumps({
+            "count": "3", "outer": {"enabled": "yes"}, "ignored": True,
+        })))
+        self.assertEqual(repaired["count"], 3)
+        self.assertEqual(repaired["outer"]["text"], "N/A")
+        self.assertTrue(repaired["outer"]["enabled"])
+        self.assertNotIn("ignored", repaired)
+
     def test_real_native_capture_after_normalization(self):
         source = os.getenv("GROK_NATIVE_CAPTURE", "/tmp/grok_native_upstream.sse")
         events = parse_sse(source)
