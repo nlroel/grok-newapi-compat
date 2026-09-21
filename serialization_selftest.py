@@ -253,6 +253,47 @@ class SerializationTests(unittest.TestCase):
         repaired = json.loads(gc._normalize_structured_output_text(req, empty_next))
         self.assertTrue(repaired["next_step"])
 
+    def test_structured_output_repairs_blocker_key_semantics(self):
+        schema = {
+            "type": "object", "additionalProperties": False,
+            "required": ["decision", "evidence", "next_step", "blocker_key"],
+            "properties": {
+                "decision": {"type": "string", "enum": ["continue", "candidate_complete", "blocked"]},
+                "evidence": {"type": "string", "minLength": 1},
+                "next_step": {"type": "string", "minLength": 1},
+                "blocker_key": {"type": "string"},
+            },
+        }
+        req = {"text": {"format": {"type": "json_schema", "json_schema": {
+            "name": "structured_output", "strict": True, "schema": schema
+        }}}}
+
+        blocked = gc._normalize_structured_output_text(req, json.dumps({
+            "decision": "blocked", "evidence": "  missing access  ",
+            "next_step": "", "blocker_key": "Missing GitHub Access!",
+        }))
+        repaired = json.loads(blocked)
+        self.assertEqual(repaired["decision"], "blocked")
+        self.assertEqual(repaired["blocker_key"], "missing_github_access")
+        self.assertTrue(repaired["next_step"])
+
+        complete = gc._normalize_structured_output_text(req, json.dumps({
+            "decision": "candidate_complete", "evidence": "tests passed",
+            "next_step": "no more work", "blocker_key": "should_be_empty",
+        }))
+        repaired = json.loads(complete)
+        self.assertEqual(repaired["blocker_key"], "")
+
+    def test_stream_usage_is_always_present(self):
+        events = []
+        bridge = gc.StreamBridge({"model": "m"}, [], lambda raw: events.append(json.loads(raw)))
+        bridge.start()
+        bridge.process_chunk({"choices": [{"delta": {"content": "hi"}}]})
+        bridge.finish()
+        completed = next(x for x in events if x.get("type") == "response.completed")
+        self.assertIsInstance(completed["response"]["usage"], dict)
+        self.assertIn("total_tokens", completed["response"]["usage"])
+
     def test_structured_output_stream_suppresses_raw_deltas(self):
         schema = {
             "type": "object",

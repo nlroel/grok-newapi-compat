@@ -18,6 +18,7 @@ import http.server
 import json
 import logging
 import os
+import re
 import socket
 import threading
 import time
@@ -389,6 +390,32 @@ def _schema_string_fallback(name, schema, decision):
     return "N/A"
 
 
+def _normalize_decision_value(value):
+    """Map common decision spellings to the goal evaluator enum."""
+    if not isinstance(value, str):
+        return None
+    key = value.strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "continue": "continue",
+        "candidate_complete": "candidate_complete",
+        "candidatecomplete": "candidate_complete",
+        "complete": "candidate_complete",
+        "blocked": "blocked",
+        "block": "blocked",
+    }
+    return aliases.get(key)
+
+
+def _normalize_blocker_key(value):
+    """Coerce a blocker identity to xAI's lowercase snake_case rule."""
+    if not isinstance(value, str):
+        value = ""
+    value = value.strip().lower()
+    value = re.sub(r"[^a-z0-9_]+", "_", value)
+    value = re.sub(r"_+", "_", value).strip("_")
+    return value[:128]
+
+
 def _conform_model_json_to_schema(obj, schema):
     """Repair common provider deviations from a Responses JSON schema."""
     if not isinstance(obj, dict) or not isinstance(schema, dict):
@@ -404,12 +431,18 @@ def _conform_model_json_to_schema(obj, schema):
             repaired["decision"] = "blocked"
         elif "continue" in repaired:
             repaired["decision"] = "continue" if repaired.get("continue") is True else "candidate_complete"
+    if "decision" in repaired:
+        normalized = _normalize_decision_value(repaired["decision"])
+        if normalized:
+            repaired["decision"] = normalized
 
     required = schema.get("required") if isinstance(schema.get("required"), list) else []
     properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
     for name in required:
         prop = properties.get(name) if isinstance(properties.get(name), dict) else {}
-        if name not in repaired or repaired[name] is None:
+        value = repaired.get(name)
+        invalid_empty_string = isinstance(value, str) and not value.strip()
+        if name not in repaired or value is None or invalid_empty_string:
             if name == "decision" and isinstance(prop.get("enum"), list) and prop["enum"]:
                 repaired[name] = prop["enum"][0]
             elif prop.get("type") == "string":
@@ -426,22 +459,26 @@ def _conform_model_json_to_schema(obj, schema):
                 repaired[name] = 0
             elif prop.get("type") == "boolean":
                 repaired[name] = False
-        elif prop.get("type") == "string" and repaired[name] == "":
-            repaired[name] = _schema_string_fallback(
-                name, prop, repaired.get("decision") if isinstance(repaired.get("decision"), str) else ""
-            )
+
+        # xAI's goal parser is stricter than the JSON schema: it validates
+        # semantic relationships between decision and blocker_key as well.
+        if name == "blocker_key" and repaired.get("decision") == "blocked":
+            repaired[name] = _normalize_blocker_key(repaired.get(name)) or "unknown_blocker"
+        elif name == "blocker_key":
+            repaired[name] = ""
+
         enum = prop.get("enum")
-        if isinstance(enum, list) and repaired[name] not in enum:
+        if isinstance(enum, list) and repaired.get(name) not in enum:
             # A legacy mapping may already have set a valid decision above.
-            repaired[name] = repaired["decision"] if name != "decision" and isinstance(
-                repaired.get("decision"), str
-            ) and repaired["decision"] in enum else (enum[0] if enum else repaired[name])
+            decision = repaired.get("decision")
+            if name != "decision" and isinstance(decision, str) and decision in enum:
+                repaired[name] = decision
+            elif enum:
+                repaired[name] = enum[0]
 
     if schema.get("additionalProperties") is False and isinstance(properties, dict):
         repaired = {key: value for key, value in repaired.items() if key in properties}
     return repaired
-
-
 def _normalize_structured_output_text(req, text):
     """Make provider JSON conform closely enough for strict Responses clients."""
     schema = _response_json_schema(req)
@@ -1421,6 +1458,11 @@ class StreamBridge:
             status=status,
             output=self.final_output(),
         )
+        if response.get("usage") is None:
+            # xAI's goal evaluator rejects a terminal response without usage
+            # accounting.  Keep the terminal frame valid even if a broken
+            # upstream omitted Chat Completions usage.
+            response["usage"] = _usage_from_chat({})
         response["incomplete_details"] = incomplete_details
         self.emit("response.completed", {"response": response})
         self.completed = True
